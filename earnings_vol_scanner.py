@@ -13,21 +13,20 @@ st.set_page_config(layout="wide", page_title="Earnings Volatility Scanner")
 def fetch_universe():
     today = pd.Timestamp.today().normalize()
     end_date = today + pd.Timedelta(days=21)
-
-    # Load S&P 500 tickers from Wikipedia
-    sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-    tickers = sp500['Symbol'].tolist()
-
+    
+    # Fetch earnings calendar for next 21 days
+    calendar = yf.download("SPY", start=today, end=end_date)
+    
     earnings_list = []
 
-    for ticker in tickers:
+    for ticker in calendar['Tickers']:
         try:
             stock = yf.Ticker(ticker)
-            earnings_dates = stock.calendar
-            if not earnings_dates.empty:
-                next_earnings = earnings_dates.loc['Earnings Date'][0]
-                if isinstance(next_earnings, pd.Timestamp) and today <= next_earnings <= end_date:
-                    earnings_list.append((ticker, next_earnings.date()))
+            earnings_dates = stock.earnings_dates
+            if earnings_dates is not None:
+                upcoming_earnings = earnings_dates[earnings_dates.index <= end_date]
+                if not upcoming_earnings.empty:
+                    earnings_list.append((ticker, upcoming_earnings.index[0].date()))
         except:
             continue
 
