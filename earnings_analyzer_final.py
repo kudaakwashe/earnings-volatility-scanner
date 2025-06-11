@@ -117,7 +117,7 @@ if st.button("Analyze"):
             ax.set_ylabel("IV")
             ax.legend()
             st.pyplot(fig)
-with col2:
+        with col2:
             st.subheader(f"IV vs RV - {r['ticker']}")
             fig2, ax2 = plt.subplots()
             ax2.bar(['IV30', 'RV30'], [r['iv30'], r['rv30']])
