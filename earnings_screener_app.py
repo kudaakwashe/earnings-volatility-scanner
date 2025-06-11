@@ -90,6 +90,8 @@ def compute_recommendation(ticker):
             'iv30_rv30': 'PASS' if iv30_rv30 >= 1.25 else 'FAIL',
             'ts_slope_0_45': 'PASS' if ts_slope <= -0.00406 else 'FAIL',
             'Expected Move': f"{round((straddle / price) * 100, 2)}%" if straddle else 'N/A',
+            'iv30_rv30_val': round(iv30_rv30, 3),
+            'ts_slope_val': round(ts_slope, 5),
             'Error': '',
             'Term_Days': raw_days,
             'Term_IVs': raw_ivs,
@@ -141,77 +143,59 @@ if st.button("Analyze"):
         filtered_df = df[df['Recommendation'].isin(selected_filters)]
 
         st.dataframe(
-            filtered_df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45', 'Expected Move', 'Recommendation']]
+            filtered_df[['Ticker', 'avg_volume', 'iv30_rv30', 'iv30_rv30_val',
+                         'ts_slope_0_45', 'ts_slope_val', 'Expected Move', 'Recommendation']]
             .reset_index(drop=True),
             use_container_width=True
         )
 
-        selected_row = st.selectbox("Select a ticker to view details", filtered_df['Ticker'].tolist())
-        row = filtered_df[filtered_df['Ticker'] == selected_row].iloc[0]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=row['Term_Days'],
-            y=row['Term_IVs'],
-            mode='lines+markers',
-            name=f'{selected_row} IV Term Structure'
-        ))
-        fig.update_layout(
-            title=f"IV Term Structure for {selected_row}",
-            xaxis_title="Days to Expiration",
-            yaxis_title="Implied Volatility",
-            height=400
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        try:
-            stock = yf.Ticker(selected_row)
-            available_expiries = stock.options
-            selected_expiry = st.selectbox(
-                f"Select Expiration Date for {selected_row}", available_expiries
-            )
-
-            chain = stock.option_chain(selected_expiry)
-            calls_df = chain.calls[['strike', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']]
-            puts_df = chain.puts[['strike', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']]
-
-            min_strike = min(calls_df['strike'].min(), puts_df['strike'].min())
-            max_strike = max(calls_df['strike'].max(), puts_df['strike'].max())
-            strike_range = st.slider("Select Strike Price Range", float(min_strike), float(max_strike),
-                                     (float(min_strike), float(max_strike)))
-
-            calls_df = calls_df[(calls_df['strike'] >= strike_range[0]) & (calls_df['strike'] <= strike_range[1])]
-            puts_df = puts_df[(puts_df['strike'] >= strike_range[0]) & (puts_df['strike'] <= strike_range[1])]
-
+        st.subheader("📊 IV Term Structure and Skew")
+        for _, row in filtered_df.iterrows():
             col1, col2 = st.columns(2)
+
             with col1:
-                st.markdown("### 🟦 Calls")
-                st.dataframe(calls_df.reset_index(drop=True), use_container_width=True)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=row['Term_Days'],
+                    y=row['Term_IVs'],
+                    mode='lines+markers',
+                    name=f"{row['Ticker']} IV Term Structure"
+                ))
+                fig.update_layout(
+                    title=f"IV Term Structure: {row['Ticker']}",
+                    xaxis_title="Days to Expiration",
+                    yaxis_title="Implied Volatility",
+                    height=350
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
             with col2:
-                st.markdown("### 🟥 Puts")
-                st.dataframe(puts_df.reset_index(drop=True), use_container_width=True)
+                try:
+                    stock = yf.Ticker(row['Ticker'])
+                    expiry = stock.options[0]
+                    chain = stock.option_chain(expiry)
+                    calls = chain.calls
+                    puts = chain.puts
 
-            fig_iv = go.Figure()
-            fig_iv.add_trace(go.Scatter(
-                x=calls_df['strike'],
-                y=calls_df['impliedVolatility'],
-                mode='lines+markers',
-                name='Calls IV',
-                line=dict(color='blue')
-            ))
-            fig_iv.add_trace(go.Scatter(
-                x=puts_df['strike'],
-                y=puts_df['impliedVolatility'],
-                mode='lines+markers',
-                name='Puts IV',
-                line=dict(color='red')
-            ))
-            fig_iv.update_layout(
-                title=f"IV Skew for {selected_row} - Expiry {selected_expiry}",
-                xaxis_title="Strike",
-                yaxis_title="Implied Volatility",
-                height=400
-            )
-            st.plotly_chart(fig_iv, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Failed to load option chain for {selected_row}: {e}")
+                    fig_skew = go.Figure()
+                    fig_skew.add_trace(go.Scatter(
+                        x=calls['strike'],
+                        y=calls['impliedVolatility'],
+                        mode='lines+markers',
+                        name='Calls IV'
+                    ))
+                    fig_skew.add_trace(go.Scatter(
+                        x=puts['strike'],
+                        y=puts['impliedVolatility'],
+                        mode='lines+markers',
+                        name='Puts IV'
+                    ))
+                    fig_skew.update_layout(
+                        title=f"IV Skew: {row['Ticker']} ({expiry})",
+                        xaxis_title="Strike",
+                        yaxis_title="Implied Volatility",
+                        height=350
+                    )
+                    st.plotly_chart(fig_skew, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Error plotting IV skew for {row['Ticker']}: {e}")
