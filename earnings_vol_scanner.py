@@ -5,113 +5,159 @@ import numpy as np
 from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-st.set_page_config(layout="wide", page_title="Earnings Volatility Scanner")
 
-# Function to fetch tickers based on earnings calendar within the next 21 days
-def fetch_universe():
-    today = pd.Timestamp.today().normalize()
-    end_date = today + pd.Timedelta(days=21)
-    
-    # Fetch earnings calendar for next 21 days
-    calendar = yf.download("SPY", start=today, end=end_date)
-    
-    earnings_list = []
+# --- Yang-Zhang Volatility Calculation ---
+def yang_zhang(price_data, window=30, trading_periods=252):
+    log_ho = np.log(price_data['High'] / price_data['Open'])
+    log_lo = np.log(price_data['Low'] / price_data['Open'])
+    log_co = np.log(price_data['Close'] / price_data['Open'])
+    log_oc = np.log(price_data['Open'] / price_data['Close'].shift(1))
+    log_cc = np.log(price_data['Close'] / price_data['Close'].shift(1))
 
-    for ticker in calendar['Tickers']:
-        try:
-            stock = yf.Ticker(ticker)
-            earnings_dates = stock.earnings_dates
-            if earnings_dates is not None:
-                upcoming_earnings = earnings_dates[earnings_dates.index <= end_date]
-                if not upcoming_earnings.empty:
-                    earnings_list.append((ticker, upcoming_earnings.index[0].date()))
-        except:
-            continue
-
-    return earnings_list
-
-def yang_zhang(hist):
-    w = 30
-    log_oc = np.log(hist['Open'] / hist['Close'].shift(1))
-    log_cc = np.log(hist['Close'] / hist['Close'].shift(1))
-    log_ho = np.log(hist['High'] / hist['Open'])
-    log_lo = np.log(hist['Low'] / hist['Open'])
-    log_co = np.log(hist['Close'] / hist['Open'])
     rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
-    co2 = (log_cc ** 2).rolling(w).sum() / (w - 1)
-    oo2 = (log_oc ** 2).rolling(w).sum() / (w - 1)
-    rsum = rs.rolling(w).sum() / (w - 1)
-    k = 0.34 / (1.34 + (w + 1)/(w - 1))
-    vol = (oo2 + k * co2 + (1 - k) * rsum).apply(np.sqrt) * np.sqrt(252)
-    return vol.dropna().iloc[-1]
 
-def plot_iv_vs_rv(iv30, rv30):
-    fig, ax = plt.subplots(figsize=(6, 3))
-    bars = ax.bar(['IV30', 'RV30'], [iv30, rv30], color=['skyblue', 'orange'])
-    for bar in bars:
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}', ha='center', va='bottom')
-    ax.set_title("IV30 vs RV30")
-    return fig
+    open_vol = log_oc.pow(2).rolling(window).sum() / (window - 1)
+    close_vol = log_cc.pow(2).rolling(window).sum() / (window - 1)
+    window_rs = rs.rolling(window).sum() / (window - 1)
 
-def plot_term_structure(dtes, ivs):
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.plot(dtes, ivs, marker='o')
-    ax.set_xlabel("Days to Expiration")
-    ax.set_ylabel("Implied Volatility")
-    ax.set_title("IV Term Structure")
-    return fig
+    k = 0.34 / (1.34 + (window + 1) / (window - 1))
+    result = np.sqrt((open_vol + k * close_vol + (1 - k) * window_rs) * trading_periods)
+    return result.dropna().iloc[-1]
 
-def compute_metrics(ticker, earn_date):
-    stock = yf.Ticker(ticker)
-    price = stock.history(period="1d")['Close'].iloc[-1]
-    hist = stock.history(period="3mo")
-    rv = yang_zhang(hist)
 
-    ivs, dtes, total_vol = [], [], 0
-    for exp in stock.options:
-        d = pd.to_datetime(exp).date()
-        days = (d - datetime.today().date()).days
-        if days < 0 or days > 60: continue
-        chain = stock.option_chain(exp)
-        pr = price
-        calls, puts = chain.calls, chain.puts
-        if calls.empty or puts.empty: continue
-        c = calls.iloc[(calls['strike'] - pr).abs().argsort()[:1]].iloc[0]
-        p = puts.iloc[(puts['strike'] - pr).abs().argsort()[:1]].iloc[0]
-        total_vol += c['volume'] + p['volume']
-        ivs.append((c['impliedVolatility'] + p['impliedVolatility']) / 2)
-        dtes.append(days)
-    if total_vol < 500 or len(ivs) < 2:
+# --- Build Term Structure ---
+def build_term_structure(days, ivs):
+    days = np.array(days)
+    ivs = np.array(ivs)
+    sort_idx = days.argsort()
+    days = days[sort_idx]
+    ivs = ivs[sort_idx]
+    spline = interp1d(days, ivs, kind='linear', fill_value="extrapolate")
+
+    def term_spline(dte):
+        if dte < days[0]: return ivs[0]
+        if dte > days[-1]: return ivs[-1]
+        return float(spline(dte))
+
+    return term_spline
+
+
+# --- Filter Expiry Dates ---
+def filter_expiries(dates):
+    today = datetime.today().date()
+    cutoff = today + timedelta(days=45)
+    sorted_dates = sorted(datetime.strptime(date, "%Y-%m-%d").date() for date in dates)
+    arr = [d.strftime("%Y-%m-%d") for d in sorted_dates if d >= cutoff]
+    return arr[:3]  # Limit to 3 expiries for efficiency
+
+
+# --- Process Single Ticker ---
+def process_ticker(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        if len(stock.options) == 0:
+            return None
+
+        exp_dates = filter_expiries(stock.options)
+        if not exp_dates:
+            return None
+
+        current_price = stock.history(period="1d")["Close"].iloc[-1]
+        atm_iv = {}
+        straddle_price = None
+
+        for i, exp_date in enumerate(exp_dates):
+            chain = stock.option_chain(exp_date)
+            calls = chain.calls
+            puts = chain.puts
+
+            if calls.empty or puts.empty:
+                continue
+
+            call_idx = (calls['strike'] - current_price).abs().idxmin()
+            put_idx = (puts['strike'] - current_price).abs().idxmin()
+
+            call_iv = calls.loc[call_idx, 'impliedVolatility']
+            put_iv = puts.loc[put_idx, 'impliedVolatility']
+            atm_iv[exp_date] = (call_iv + put_iv) / 2
+
+            if i == 0:
+                call_mid = (calls.loc[call_idx, 'bid'] + calls.loc[call_idx, 'ask']) / 2
+                put_mid = (puts.loc[put_idx, 'bid'] + puts.loc[put_idx, 'ask']) / 2
+                straddle_price = call_mid + put_mid
+
+        if not atm_iv:
+            return None
+
+        today = datetime.today().date()
+        dtes = [(datetime.strptime(k, "%Y-%m-%d").date() - today).days for k in atm_iv.keys()]
+        iv_values = list(atm_iv.values())
+
+        term_func = build_term_structure(dtes, iv_values)
+        slope = (term_func(45) - term_func(min(dtes))) / (45 - min(dtes))
+
+        history = stock.history(period="3mo")
+        if history.empty:
+            return None
+        rv = yang_zhang(history)
+        iv30 = term_func(30)
+        iv_rv_ratio = iv30 / rv
+
+        avg_volume = history['Volume'].rolling(30).mean().iloc[-1]
+        expected_move = round(straddle_price / current_price * 100, 2) if straddle_price else None
+
+        return {
+            'ticker': ticker,
+            'current_price': current_price,
+            'avg_volume': avg_volume,
+            'iv30': iv30,
+            'rv30': rv,
+            'iv30/rv30': iv_rv_ratio,
+            'term_slope_0_45': slope,
+            'expected_move_%': expected_move,
+            'term_structure': (dtes, iv_values)
+        }
+    except Exception:
         return None
 
-    ts = interp1d(dtes, ivs, fill_value="extrapolate")
-    iv30 = float(ts(30))
-    slope = (ts(45) - ts(min(dtes))) / (45 - min(dtes))
-    exp_move = ((c['bid']+c['ask'])/2 + (p['bid']+p['ask'])/2) / price * 100
 
-    return dict(Ticker=ticker, EarningsDate=earn_date, Price=price,
-                IV30=iv30, RV30=rv, IVRV=iv30/rv,
-                Slope=slope, Volume=total_vol,
-                ExpMove=exp_move, dtes=dtes, ivs=ivs)
+# --- Streamlit UI ---
+st.title("Earnings IV/RV Scanner")
+st.write("Enter comma-separated tickers:")
 
-def main():
-    st.title("Earnings Volatility Scanner")
-    universe = fetch_universe()
-    results = [compute_metrics(t, d) for t, d in universe]
-    results = [r for r in results if r]
-    if not results:
-        st.warning("No qualifying stocks found.")
-        return
-    df = pd.DataFrame(results).sort_values("ExpMove", ascending=False)
-    st.dataframe(df[['Ticker','EarningsDate','Price','Volume','IV30','RV30','IVRV','Slope','ExpMove']])
+tickers_input = st.text_input("Tickers", "AAPL,MSFT,NVDA,GOOGL,AMZN")
 
-    ticker = st.selectbox("Chart Ticker", df['Ticker'])
-    row = next(r for r in results if r['Ticker']==ticker)
-    st.pyplot(plot_iv_vs_rv(row['IV30'], row['RV30']))
-    st.pyplot(plot_term_structure(row['dtes'], row['ivs']))
+if st.button("Run Scan"):
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    results = []
 
-if __name__=="__main__":
-    main()
+    for t in tickers:
+        with st.spinner(f"Processing {t}..."):
+            data = process_ticker(t)
+            if data:
+                results.append(data)
+
+    if results:
+        df = pd.DataFrame(results)
+        st.dataframe(df[['ticker', 'current_price', 'avg_volume', 'iv30', 'rv30', 'iv30/rv30', 'term_slope_0_45', 'expected_move_%']])
+
+        selected_ticker = st.selectbox("Select ticker for visuals", df['ticker'])
+        selected_data = next(item for item in results if item["ticker"] == selected_ticker)
+
+        # IV vs RV
+        fig1, ax1 = plt.subplots()
+        ax1.bar(['IV30', 'RV30'], [selected_data['iv30'], selected_data['rv30']], color=['#1f77b4', '#ff7f0e'])
+        ax1.set_title(f"IV30 vs RV30: {selected_ticker}")
+        st.pyplot(fig1)
+
+        # Term Structure
+        dtes, ivs = selected_data['term_structure']
+        fig2, ax2 = plt.subplots()
+        ax2.plot(dtes, ivs, marker='o')
+        ax2.set_title(f"Term Structure: {selected_ticker}")
+        ax2.set_xlabel("DTE (Days to Expiry)")
+        ax2.set_ylabel("IV")
+        st.pyplot(fig2)
+    else:
+        st.error("No data returned for any ticker.")
