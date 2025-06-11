@@ -64,6 +64,7 @@ def compute_recommendation(ticker):
 
         atm_iv = {}
         straddle = None
+        call_iv_list, put_iv_list = pd.DataFrame(), pd.DataFrame()
         for i, (exp, chain) in enumerate(options_chains.items()):
             calls, puts = chain.calls, chain.puts
             if calls.empty or puts.empty:
@@ -71,10 +72,14 @@ def compute_recommendation(ticker):
             call_iv = calls.iloc[(calls['strike'] - price).abs().idxmin()]['impliedVolatility']
             put_iv = puts.iloc[(puts['strike'] - price).abs().idxmin()]['impliedVolatility']
             atm_iv[exp] = (call_iv + put_iv) / 2
+
             if i == 0:
                 call = calls.iloc[(calls['strike'] - price).abs().idxmin()]
                 put = puts.iloc[(puts['strike'] - price).abs().idxmin()]
                 straddle = ((call['bid'] + call['ask']) / 2) + ((put['bid'] + put['ask']) / 2)
+
+                call_iv_list = calls[['strike', 'impliedVolatility']].dropna()
+                put_iv_list = puts[['strike', 'impliedVolatility']].dropna()
 
         if not atm_iv:
             return {'Ticker': ticker, 'Error': 'Could not determine IV'}
@@ -91,25 +96,16 @@ def compute_recommendation(ticker):
 
         result = {
             'Ticker': ticker,
-            'avg_volume': 'PASS' if avg_vol >= 1_500_000 else 'FAIL',
-            'iv30_rv30': 'PASS' if iv30_rv30 >= 1.25 else 'FAIL',
-            'ts_slope_0_45': 'PASS' if ts_slope <= -0.00406 else 'FAIL',
+            'avg_volume': avg_vol,
+            'iv30_rv30': round(iv30_rv30, 2),
+            'ts_slope_0_45': round(ts_slope, 5),
             'Expected Move': f"{round((straddle / price) * 100, 2)}%" if straddle else 'N/A',
             'Error': '',
             'Term_Days': raw_days,
             'Term_IVs': raw_ivs,
+            'Call_IVs': call_iv_list,
+            'Put_IVs': put_iv_list
         }
-
-        av = result['avg_volume'] == 'PASS'
-        ivr = result['iv30_rv30'] == 'PASS'
-        ts = result['ts_slope_0_45'] == 'PASS'
-
-        if av and ivr and ts:
-            result['Recommendation'] = 'Recommended'
-        elif ts and (av or ivr):
-            result['Recommendation'] = 'Consider'
-        else:
-            result['Recommendation'] = 'Avoid'
 
         return result
 
@@ -117,113 +113,66 @@ def compute_recommendation(ticker):
         return {'Ticker': ticker, 'Error': str(e)}
 
 
-# ------------------ STREAMLIT APP ------------------ #
+# --- STREAMLIT APP UI ---
 
-st.title("📈 Earnings Position Screener")
+st.set_page_config(page_title="IV Screener", layout="wide")
+st.title("📈 IV Term Structure and Skew Viewer")
 
-tickers_input = st.text_input("Enter one or more stock symbols (comma separated)", value="AAPL, MSFT, AMZN")
+tickers_input = st.text_input("Enter stock symbols (comma separated)", value="AAPL, MSFT, AMZN")
 
 if st.button("Analyze"):
     tickers = [x.strip().upper() for x in tickers_input.split(",") if x.strip()]
     results = [compute_recommendation(ticker) for ticker in tickers]
-    df = pd.DataFrame(results)
+    df = pd.DataFrame([r for r in results if r['Error'] == ''])
 
-    if 'Error' in df.columns:
-        error_df = df[df['Error'] != '']
-        if not error_df.empty:
-            st.warning("Some tickers failed:")
-            st.dataframe(error_df[['Ticker', 'Error']])
+    st.subheader("📊 Summary Table")
+    st.dataframe(df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45', 'Expected Move']], use_container_width=True)
 
-        df = df[df['Error'] == '']
+    for res in results:
+        if res['Error'] != '':
+            st.warning(f"{res['Ticker']} - {res['Error']}")
+            continue
 
-    if not df.empty:
-        st.success("✅ Analysis complete.")
+        st.markdown(f"---\n### {res['Ticker']}")
 
-        # Filter
-        selected_filters = st.multiselect(
-            "Filter by Recommendation",
-            options=['Recommended', 'Consider', 'Avoid'],
-            default=['Recommended', 'Consider', 'Avoid']
-        )
-        filtered_df = df[df['Recommendation'].isin(selected_filters)]
-
-        st.dataframe(
-            filtered_df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45', 'Expected Move', 'Recommendation']]
-            .reset_index(drop=True),
-            use_container_width=True
-        )
-
-        # IV Term Structure
-        selected_row = st.selectbox("Select a ticker to view details", filtered_df['Ticker'].tolist())
-        row = filtered_df[filtered_df['Ticker'] == selected_row].iloc[0]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=row['Term_Days'],
-            y=row['Term_IVs'],
+        # Plot IV Term Structure
+        fig_ts = go.Figure()
+        fig_ts.add_trace(go.Scatter(
+            x=res['Term_Days'],
+            y=res['Term_IVs'],
             mode='lines+markers',
-            name=f'{selected_row} IV Term Structure'
+            name=f"{res['Ticker']} IV Term Structure"
         ))
-        fig.update_layout(
-            title=f"IV Term Structure for {selected_row}",
+        fig_ts.update_layout(
+            title=f"{res['Ticker']} - IV Term Structure",
             xaxis_title="Days to Expiration",
             yaxis_title="Implied Volatility",
-            height=400
+            height=300
         )
-        st.plotly_chart(fig, use_container_width=True)
 
-        # Option Chain with slider & IV skew chart
-        try:
-            stock = yf.Ticker(selected_row)
-            available_expiries = stock.options
-            selected_expiry = st.selectbox(
-                f"Select Expiration Date for {selected_row}", available_expiries
-            )
+        # Plot IV Skew
+        fig_skew = go.Figure()
+        fig_skew.add_trace(go.Scatter(
+            x=res['Call_IVs']['strike'],
+            y=res['Call_IVs']['impliedVolatility'],
+            mode='lines+markers',
+            name='Calls IV',
+            line=dict(color='blue')
+        ))
+        fig_skew.add_trace(go.Scatter(
+            x=res['Put_IVs']['strike'],
+            y=res['Put_IVs']['impliedVolatility'],
+            mode='lines+markers',
+            name='Puts IV',
+            line=dict(color='red')
+        ))
+        fig_skew.update_layout(
+            title=f"{res['Ticker']} - IV Skew",
+            xaxis_title="Strike",
+            yaxis_title="Implied Volatility",
+            height=300
+        )
 
-            chain = stock.option_chain(selected_expiry)
-            calls_df = chain.calls[['strike', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']]
-            puts_df = chain.puts[['strike', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']]
-
-            # Slider range for strike selection
-            min_strike = min(calls_df['strike'].min(), puts_df['strike'].min())
-            max_strike = max(calls_df['strike'].max(), puts_df['strike'].max())
-            strike_range = st.slider("Select Strike Price Range", float(min_strike), float(max_strike),
-                                     (float(min_strike), float(max_strike)))
-
-            calls_df = calls_df[(calls_df['strike'] >= strike_range[0]) & (calls_df['strike'] <= strike_range[1])]
-            puts_df = puts_df[(puts_df['strike'] >= strike_range[0]) & (puts_df['strike'] <= strike_range[1])]
-
-            # Display option tables
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("### 🟦 Calls")
-                st.dataframe(calls_df.reset_index(drop=True), use_container_width=True)
-            with col2:
-                st.markdown("### 🟥 Puts")
-                st.dataframe(puts_df.reset_index(drop=True), use_container_width=True)
-
-            # IV skew curve
-            fig_iv = go.Figure()
-            fig_iv.add_trace(go.Scatter(
-                x=calls_df['strike'],
-                y=calls_df['impliedVolatility'],
-                mode='lines+markers',
-                name='Calls IV',
-                line=dict(color='blue')
-            ))
-            fig_iv.add_trace(go.Scatter(
-                x=puts_df['strike'],
-                y=puts_df['impliedVolatility'],
-                mode='lines+markers',
-                name='Puts IV',
-                line=dict(color='red')
-            ))
-            fig_iv.update_layout(
-                title=f"IV Skew for {selected_row} - Expiry {selected_expiry}",
-                xaxis_title="Strike",
-                yaxis_title="Implied Volatility",
-                height=400
-            )
-            st.plotly_chart(fig_iv, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Failed to load option chain for {selected_row}: {e}")
+        col1, col2 = st.columns(2)
+        col1.plotly_chart(fig_ts, use_container_width=True)
+        col2.plotly_chart(fig_skew, use_container_width=True)
