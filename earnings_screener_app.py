@@ -48,22 +48,12 @@ def get_current_price(ticker_obj):
     return todays_data['Close'].iloc[0] if not todays_data.empty else None
 
 
-def get_earnings_date(ticker_obj):
-    cal = ticker_obj.calendar
-    if 'Earnings Date' in cal.index:
-        val = cal.loc['Earnings Date']
-        return val[0] if not pd.isna(val[0]) else None
-    return None
-
-
 def compute_recommendation(ticker):
     try:
         ticker = ticker.strip().upper()
         stock = yf.Ticker(ticker)
         if not stock.options:
             return {'Ticker': ticker, 'Error': 'No options found'}
-
-        earnings_date = get_earnings_date(stock)
 
         exp_dates = filter_dates(stock.options)
         options_chains = {d: stock.option_chain(d) for d in exp_dates}
@@ -72,9 +62,10 @@ def compute_recommendation(ticker):
         if price is None:
             return {'Ticker': ticker, 'Error': 'No price data'}
 
+        earnings_date = stock.calendar.T.loc['Earnings Date'].date() if 'Earnings Date' in stock.calendar.T.index else 'N/A'
+
         atm_iv = {}
         straddle = None
-        call_iv_list, put_iv_list = pd.DataFrame(), pd.DataFrame()
         for i, (exp, chain) in enumerate(options_chains.items()):
             calls, puts = chain.calls, chain.puts
             if calls.empty or puts.empty:
@@ -82,13 +73,10 @@ def compute_recommendation(ticker):
             call_iv = calls.iloc[(calls['strike'] - price).abs().idxmin()]['impliedVolatility']
             put_iv = puts.iloc[(puts['strike'] - price).abs().idxmin()]['impliedVolatility']
             atm_iv[exp] = (call_iv + put_iv) / 2
-
             if i == 0:
                 call = calls.iloc[(calls['strike'] - price).abs().idxmin()]
                 put = puts.iloc[(puts['strike'] - price).abs().idxmin()]
                 straddle = ((call['bid'] + call['ask']) / 2) + ((put['bid'] + put['ask']) / 2)
-                call_iv_list = calls[['strike', 'impliedVolatility']].dropna()
-                put_iv_list = puts[['strike', 'impliedVolatility']].dropna()
 
         if not atm_iv:
             return {'Ticker': ticker, 'Error': 'Could not determine IV'}
@@ -103,65 +91,80 @@ def compute_recommendation(ticker):
         iv30_rv30 = iv30 / rv30
         avg_vol = stock.history(period='3mo')['Volume'].rolling(30).mean().dropna().iloc[-1]
 
-        return {
+        result = {
             'Ticker': ticker,
-            'avg_volume': avg_vol,
-            'iv30_rv30': round(iv30_rv30, 2),
-            'ts_slope_0_45': round(ts_slope, 5),
+            'avg_volume': 'PASS' if avg_vol >= 1_500_000 else 'FAIL',
+            'iv30_rv30': 'PASS' if iv30_rv30 >= 1.25 else 'FAIL',
+            'ts_slope_0_45': 'PASS' if ts_slope <= -0.00406 else 'FAIL',
             'Expected Move': f"{round((straddle / price) * 100, 2)}%" if straddle else 'N/A',
-            'Earnings': earnings_date,
             'Error': '',
             'Term_Days': raw_days,
             'Term_IVs': raw_ivs,
-            'Call_IVs': call_iv_list,
-            'Put_IVs': put_iv_list
+            'iv30_rv30_ratio': iv30_rv30,
+            'Earnings Date': earnings_date
         }
+
+        av = result['avg_volume'] == 'PASS'
+        ivr = result['iv30_rv30'] == 'PASS'
+        ts = result['ts_slope_0_45'] == 'PASS'
+
+        if av and ivr and ts:
+            result['Recommendation'] = 'Recommended'
+        elif ts and (av or ivr):
+            result['Recommendation'] = 'Consider'
+        else:
+            result['Recommendation'] = 'Avoid'
+
+        return result
 
     except Exception as e:
         return {'Ticker': ticker, 'Error': str(e)}
 
 
-# ------------------ STREAMLIT APP ------------------
+# --- STREAMLIT UI LOGIC ---
 
-st.set_page_config(page_title="IV Screener", layout="wide")
-st.title("📈 IV Term Structure and Skew (Earnings Overlay)")
+st.set_page_config(page_title="Earnings Screener", layout="wide")
+st.title("📈 Earnings Position Screener")
 
 tickers_input = st.text_input("Enter stock symbols (comma separated)", value="AAPL, MSFT, AMZN")
 
 if st.button("Analyze"):
     tickers = [x.strip().upper() for x in tickers_input.split(",") if x.strip()]
-    results = [compute_recommendation(ticker) for ticker in tickers]
-    clean_results = [res for res in results if res['Error'] == '']
-    df = pd.DataFrame(clean_results)
+    st.session_state['results'] = [compute_recommendation(ticker) for ticker in tickers]
+
+# Display if results exist
+if 'results' in st.session_state:
+    df = pd.DataFrame(st.session_state['results'])
+    df = df[df['Error'] == '']
 
     if not df.empty:
-        st.subheader("📊 Summary Table")
-        st.dataframe(df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45', 'Expected Move', 'Earnings']], use_container_width=True)
+        top_iv_skew = df.sort_values(by="iv30_rv30_ratio", ascending=False).head(3)
+        st.markdown("### 🔍 Top IV Skew Tickers")
+        st.dataframe(top_iv_skew[['Ticker', 'iv30_rv30_ratio', 'Recommendation', 'Earnings Date']])
 
-        for res in clean_results:
-            st.markdown(f"---\n### {res['Ticker']}")
+        selected_filters = st.multiselect("Filter by Recommendation", ['Recommended', 'Consider', 'Avoid'],
+                                          default=['Recommended', 'Consider', 'Avoid'])
 
-            fig_term = go.Figure()
-            fig_term.add_trace(go.Scatter(x=res['Term_Days'], y=res['Term_IVs'],
-                                          mode='lines+markers', name='IV Term Structure'))
-            if res['Earnings'] and isinstance(res['Earnings'], pd.Timestamp):
-                earnings_dte = (res['Earnings'].date() - datetime.today().date()).days
-                fig_term.add_vline(x=earnings_dte, line=dict(color='orange', dash='dash'), annotation_text='Earnings')
+        filtered_df = df[df['Recommendation'].isin(selected_filters)]
+        st.markdown("### 📊 Filtered Results")
+        st.dataframe(filtered_df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45',
+                                  'Expected Move', 'Recommendation', 'Earnings Date']], use_container_width=True)
 
-            fig_term.update_layout(title=f"{res['Ticker']} - IV Term Structure",
-                                   xaxis_title="Days to Expiration", yaxis_title="Implied Volatility", height=300)
+        if not filtered_df.empty:
+            selected_row = st.selectbox("Select a ticker to view details", filtered_df['Ticker'].tolist())
+            row = filtered_df[filtered_df['Ticker'] == selected_row].iloc[0]
 
-            fig_skew = go.Figure()
-            fig_skew.add_trace(go.Scatter(x=res['Call_IVs']['strike'], y=res['Call_IVs']['impliedVolatility'],
-                                          mode='lines+markers', name='Calls IV', line=dict(color='blue')))
-            fig_skew.add_trace(go.Scatter(x=res['Put_IVs']['strike'], y=res['Put_IVs']['impliedVolatility'],
-                                          mode='lines+markers', name='Puts IV', line=dict(color='red')))
-            fig_skew.update_layout(title=f"{res['Ticker']} - IV Skew",
-                                   xaxis_title="Strike", yaxis_title="Implied Volatility", height=300)
-
-            col1, col2 = st.columns(2)
-            col1.plotly_chart(fig_term, use_container_width=True)
-            col2.plotly_chart(fig_skew, use_container_width=True)
-
-    else:
-        st.warning("No valid data retrieved.")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=row['Term_Days'],
+                y=row['Term_IVs'],
+                mode='lines+markers',
+                name=f'{selected_row} IV Term Structure'
+            ))
+            fig.update_layout(
+                title=f"IV Term Structure for {selected_row}",
+                xaxis_title="Days to Expiration",
+                yaxis_title="Implied Volatility",
+                height=400
+            )
+            st.plotly_chart(fig, use_container_width=True)
