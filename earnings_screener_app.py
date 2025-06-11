@@ -48,12 +48,22 @@ def get_current_price(ticker_obj):
     return todays_data['Close'].iloc[0] if not todays_data.empty else None
 
 
+def get_earnings_date(ticker_obj):
+    cal = ticker_obj.calendar
+    if 'Earnings Date' in cal.index:
+        val = cal.loc['Earnings Date']
+        return val[0] if not pd.isna(val[0]) else None
+    return None
+
+
 def compute_recommendation(ticker):
     try:
         ticker = ticker.strip().upper()
         stock = yf.Ticker(ticker)
         if not stock.options:
             return {'Ticker': ticker, 'Error': 'No options found'}
+
+        earnings_date = get_earnings_date(stock)
 
         exp_dates = filter_dates(stock.options)
         options_chains = {d: stock.option_chain(d) for d in exp_dates}
@@ -77,7 +87,6 @@ def compute_recommendation(ticker):
                 call = calls.iloc[(calls['strike'] - price).abs().idxmin()]
                 put = puts.iloc[(puts['strike'] - price).abs().idxmin()]
                 straddle = ((call['bid'] + call['ask']) / 2) + ((put['bid'] + put['ask']) / 2)
-
                 call_iv_list = calls[['strike', 'impliedVolatility']].dropna()
                 put_iv_list = puts[['strike', 'impliedVolatility']].dropna()
 
@@ -94,12 +103,13 @@ def compute_recommendation(ticker):
         iv30_rv30 = iv30 / rv30
         avg_vol = stock.history(period='3mo')['Volume'].rolling(30).mean().dropna().iloc[-1]
 
-        result = {
+        return {
             'Ticker': ticker,
             'avg_volume': avg_vol,
             'iv30_rv30': round(iv30_rv30, 2),
             'ts_slope_0_45': round(ts_slope, 5),
             'Expected Move': f"{round((straddle / price) * 100, 2)}%" if straddle else 'N/A',
+            'Earnings': earnings_date,
             'Error': '',
             'Term_Days': raw_days,
             'Term_IVs': raw_ivs,
@@ -107,72 +117,51 @@ def compute_recommendation(ticker):
             'Put_IVs': put_iv_list
         }
 
-        return result
-
     except Exception as e:
         return {'Ticker': ticker, 'Error': str(e)}
 
 
-# --- STREAMLIT APP UI ---
+# ------------------ STREAMLIT APP ------------------
 
 st.set_page_config(page_title="IV Screener", layout="wide")
-st.title("📈 IV Term Structure and Skew Viewer")
+st.title("📈 IV Term Structure and Skew (Earnings Overlay)")
 
 tickers_input = st.text_input("Enter stock symbols (comma separated)", value="AAPL, MSFT, AMZN")
 
 if st.button("Analyze"):
     tickers = [x.strip().upper() for x in tickers_input.split(",") if x.strip()]
     results = [compute_recommendation(ticker) for ticker in tickers]
-    df = pd.DataFrame([r for r in results if r['Error'] == ''])
+    clean_results = [res for res in results if res['Error'] == '']
+    df = pd.DataFrame(clean_results)
 
-    st.subheader("📊 Summary Table")
-    st.dataframe(df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45', 'Expected Move']], use_container_width=True)
+    if not df.empty:
+        st.subheader("📊 Summary Table")
+        st.dataframe(df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45', 'Expected Move', 'Earnings']], use_container_width=True)
 
-    for res in results:
-        if res['Error'] != '':
-            st.warning(f"{res['Ticker']} - {res['Error']}")
-            continue
+        for res in clean_results:
+            st.markdown(f"---\n### {res['Ticker']}")
 
-        st.markdown(f"---\n### {res['Ticker']}")
+            fig_term = go.Figure()
+            fig_term.add_trace(go.Scatter(x=res['Term_Days'], y=res['Term_IVs'],
+                                          mode='lines+markers', name='IV Term Structure'))
+            if res['Earnings'] and isinstance(res['Earnings'], pd.Timestamp):
+                earnings_dte = (res['Earnings'].date() - datetime.today().date()).days
+                fig_term.add_vline(x=earnings_dte, line=dict(color='orange', dash='dash'), annotation_text='Earnings')
 
-        # Plot IV Term Structure
-        fig_ts = go.Figure()
-        fig_ts.add_trace(go.Scatter(
-            x=res['Term_Days'],
-            y=res['Term_IVs'],
-            mode='lines+markers',
-            name=f"{res['Ticker']} IV Term Structure"
-        ))
-        fig_ts.update_layout(
-            title=f"{res['Ticker']} - IV Term Structure",
-            xaxis_title="Days to Expiration",
-            yaxis_title="Implied Volatility",
-            height=300
-        )
+            fig_term.update_layout(title=f"{res['Ticker']} - IV Term Structure",
+                                   xaxis_title="Days to Expiration", yaxis_title="Implied Volatility", height=300)
 
-        # Plot IV Skew
-        fig_skew = go.Figure()
-        fig_skew.add_trace(go.Scatter(
-            x=res['Call_IVs']['strike'],
-            y=res['Call_IVs']['impliedVolatility'],
-            mode='lines+markers',
-            name='Calls IV',
-            line=dict(color='blue')
-        ))
-        fig_skew.add_trace(go.Scatter(
-            x=res['Put_IVs']['strike'],
-            y=res['Put_IVs']['impliedVolatility'],
-            mode='lines+markers',
-            name='Puts IV',
-            line=dict(color='red')
-        ))
-        fig_skew.update_layout(
-            title=f"{res['Ticker']} - IV Skew",
-            xaxis_title="Strike",
-            yaxis_title="Implied Volatility",
-            height=300
-        )
+            fig_skew = go.Figure()
+            fig_skew.add_trace(go.Scatter(x=res['Call_IVs']['strike'], y=res['Call_IVs']['impliedVolatility'],
+                                          mode='lines+markers', name='Calls IV', line=dict(color='blue')))
+            fig_skew.add_trace(go.Scatter(x=res['Put_IVs']['strike'], y=res['Put_IVs']['impliedVolatility'],
+                                          mode='lines+markers', name='Puts IV', line=dict(color='red')))
+            fig_skew.update_layout(title=f"{res['Ticker']} - IV Skew",
+                                   xaxis_title="Strike", yaxis_title="Implied Volatility", height=300)
 
-        col1, col2 = st.columns(2)
-        col1.plotly_chart(fig_ts, use_container_width=True)
-        col2.plotly_chart(fig_skew, use_container_width=True)
+            col1, col2 = st.columns(2)
+            col1.plotly_chart(fig_term, use_container_width=True)
+            col2.plotly_chart(fig_skew, use_container_width=True)
+
+    else:
+        st.warning("No valid data retrieved.")
