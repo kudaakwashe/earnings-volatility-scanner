@@ -121,7 +121,7 @@ def compute_recommendation(ticker):
         return {'Ticker': ticker, 'Error': str(e)}
 
 
-# --- STREAMLIT UI LOGIC ---
+# ----------------- STREAMLIT UI -----------------
 
 st.set_page_config(page_title="Earnings Screener", layout="wide")
 st.title("📈 Earnings Position Screener")
@@ -130,41 +130,34 @@ tickers_input = st.text_input("Enter stock symbols (comma separated)", value="AA
 
 if st.button("Analyze"):
     tickers = [x.strip().upper() for x in tickers_input.split(",") if x.strip()]
-    st.session_state['results'] = [compute_recommendation(ticker) for ticker in tickers]
-
-# Display if results exist
-if 'results' in st.session_state:
-    df = pd.DataFrame(st.session_state['results'])
-    df = df[df['Error'] == '']
+    results = [compute_recommendation(ticker) for ticker in tickers]
+    df = pd.DataFrame(results)
 
     if not df.empty:
-        top_iv_skew = df.sort_values(by="iv30_rv30_ratio", ascending=False).head(3)
-        st.markdown("### 🔍 Top IV Skew Tickers")
-        st.dataframe(top_iv_skew[['Ticker', 'iv30_rv30_ratio', 'Recommendation', 'Earnings Date']])
+        df = df[df['Error'] == '']
 
-        selected_filters = st.multiselect("Filter by Recommendation", ['Recommended', 'Consider', 'Avoid'],
-                                          default=['Recommended', 'Consider', 'Avoid'])
+        st.subheader("🔍 Top IV Skew Tickers")
+        top_iv = df.sort_values(by="iv30_rv30_ratio", ascending=False).head(3)
+        st.dataframe(top_iv[['Ticker', 'iv30_rv30_ratio', 'Recommendation', 'Earnings Date']])
 
-        filtered_df = df[df['Recommendation'].isin(selected_filters)]
-        st.markdown("### 📊 Filtered Results")
-        st.dataframe(filtered_df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45',
-                                  'Expected Move', 'Recommendation', 'Earnings Date']], use_container_width=True)
+        st.subheader("📊 All Results")
+        st.dataframe(df[['Ticker', 'avg_volume', 'iv30_rv30', 'ts_slope_0_45',
+                         'Expected Move', 'Recommendation', 'Earnings Date']], use_container_width=True)
 
-        if not filtered_df.empty:
-            selected_row = st.selectbox("Select a ticker to view details", filtered_df['Ticker'].tolist())
-            row = filtered_df[filtered_df['Ticker'] == selected_row].iloc[0]
+        selected = st.selectbox("Select a ticker to view IV curve", df['Ticker'].tolist())
+        row = df[df['Ticker'] == selected].iloc[0]
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=row['Term_Days'],
-                y=row['Term_IVs'],
-                mode='lines+markers',
-                name=f'{selected_row} IV Term Structure'
-            ))
-            fig.update_layout(
-                title=f"IV Term Structure for {selected_row}",
-                xaxis_title="Days to Expiration",
-                yaxis_title="Implied Volatility",
-                height=400
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=row['Term_Days'],
+            y=row['Term_IVs'],
+            mode='lines+markers',
+            name=f"{selected} IV Curve"
+        ))
+        fig.update_layout(
+            title=f"IV Term Structure: {selected}",
+            xaxis_title="Days to Expiration",
+            yaxis_title="Implied Volatility",
+            height=400
+        )
+        st.plotly_chart(fig, use_container_width=True)
