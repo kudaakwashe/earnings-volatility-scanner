@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-
 def filter_dates(dates):
     today = datetime.today().date()
     cutoff_date = today + timedelta(days=45)
@@ -18,7 +17,6 @@ def filter_dates(dates):
                 return arr[1:]
             return arr
     raise ValueError("No date 45 days or more in the future found.")
-
 
 def yang_zhang(price_data, window=30, trading_periods=252):
     price_data = price_data.dropna(subset=['Open', 'Close', 'High', 'Low'])
@@ -37,16 +35,13 @@ def yang_zhang(price_data, window=30, trading_periods=252):
     result = (open_vol + k * close_vol + (1 - k) * window_rs).pow(0.5) * np.sqrt(trading_periods)
     return result.dropna().iloc[-1]
 
-
 def build_term_structure(days, ivs):
     spline = interp1d(sorted(days), [ivs[i] for i in np.argsort(days)], kind='linear', fill_value="extrapolate")
     return lambda dte: float(spline(dte)), days, ivs
 
-
 def get_current_price(ticker_obj):
     todays_data = ticker_obj.history(period='1d')
     return todays_data['Close'].iloc[0] if not todays_data.empty else None
-
 
 def compute_recommendation(ticker):
     try:
@@ -116,7 +111,6 @@ def compute_recommendation(ticker):
     except Exception as e:
         return {'Ticker': ticker, 'Error': str(e)}
 
-
 # ------------------ STREAMLIT APP ------------------ #
 
 st.title("📈 Earnings Position Screener")
@@ -139,7 +133,6 @@ if st.button("Analyze"):
     if not df.empty:
         st.success("✅ Analysis complete.")
 
-        # Filter
         selected_filters = st.multiselect(
             "Filter by Recommendation",
             options=['Recommended', 'Consider', 'Avoid'],
@@ -153,7 +146,6 @@ if st.button("Analyze"):
             use_container_width=True
         )
 
-        # IV Term Structure
         selected_row = st.selectbox("Select a ticker to view details", filtered_df['Ticker'].tolist())
         row = filtered_df[filtered_df['Ticker'] == selected_row].iloc[0]
         fig = go.Figure()
@@ -171,7 +163,6 @@ if st.button("Analyze"):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Option Chain with slider & IV skew chart
         try:
             stock = yf.Ticker(selected_row)
             available_expiries = stock.options
@@ -183,7 +174,6 @@ if st.button("Analyze"):
             calls_df = chain.calls[['strike', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']]
             puts_df = chain.puts[['strike', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']]
 
-            # Slider range for strike selection
             min_strike = min(calls_df['strike'].min(), puts_df['strike'].min())
             max_strike = max(calls_df['strike'].max(), puts_df['strike'].max())
             strike_range = st.slider("Select Strike Price Range", float(min_strike), float(max_strike),
@@ -192,7 +182,6 @@ if st.button("Analyze"):
             calls_df = calls_df[(calls_df['strike'] >= strike_range[0]) & (calls_df['strike'] <= strike_range[1])]
             puts_df = puts_df[(puts_df['strike'] >= strike_range[0]) & (puts_df['strike'] <= strike_range[1])]
 
-            # Display option tables
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("### 🟦 Calls")
@@ -201,7 +190,6 @@ if st.button("Analyze"):
                 st.markdown("### 🟥 Puts")
                 st.dataframe(puts_df.reset_index(drop=True), use_container_width=True)
 
-            # IV skew curve
             fig_iv = go.Figure()
             fig_iv.add_trace(go.Scatter(
                 x=calls_df['strike'],
