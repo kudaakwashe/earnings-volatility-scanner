@@ -1,48 +1,3 @@
-import streamlit as st
-import yfinance as yf
-from datetime import datetime, timedelta
-from scipy.interpolate import interp1d
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-
-def filter_dates(dates):
-    today = datetime.today().date()
-    cutoff_date = today + timedelta(days=45)
-    sorted_dates = sorted(datetime.strptime(date, "%Y-%m-%d").date() for date in dates)
-    for i, date in enumerate(sorted_dates):
-        if date >= cutoff_date:
-            arr = [d.strftime("%Y-%m-%d") for d in sorted_dates[:i + 1]]
-            if arr and arr[0] == today.strftime("%Y-%m-%d"):
-                return arr[1:]
-            return arr
-    raise ValueError("No date 45 days or more in the future found.")
-
-def yang_zhang(price_data, window=30, trading_periods=252):
-    price_data = price_data.dropna(subset=['Open', 'Close', 'High', 'Low'])
-    log_ho = np.log(price_data['High'] / price_data['Open'])
-    log_lo = np.log(price_data['Low'] / price_data['Open'])
-    log_co = np.log(price_data['Close'] / price_data['Open'])
-    log_oc = np.log(price_data['Open'] / price_data['Close'].shift(1))
-    log_cc = np.log(price_data['Close'] / price_data['Close'].shift(1))
-
-    rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
-    close_vol = log_cc.pow(2).rolling(window).sum() / (window - 1)
-    open_vol = log_oc.pow(2).rolling(window).sum() / (window - 1)
-    window_rs = rs.rolling(window).sum() / (window - 1)
-
-    k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
-    result = (open_vol + k * close_vol + (1 - k) * window_rs).pow(0.5) * np.sqrt(trading_periods)
-    return result.dropna().iloc[-1]
-
-def build_term_structure(days, ivs):
-    spline = interp1d(sorted(days), [ivs[i] for i in np.argsort(days)], kind='linear', fill_value="extrapolate")
-    return lambda dte: float(spline(dte)), days, ivs
-
-def get_current_price(ticker_obj):
-    todays_data = ticker_obj.history(period='1d')
-    return todays_data['Close'].iloc[0] if not todays_data.empty else None
-
 def compute_recommendation(ticker):
     try:
         ticker = ticker.strip().upper()
@@ -113,6 +68,7 @@ def compute_recommendation(ticker):
     except Exception as e:
         return {'Ticker': ticker, 'Error': str(e)}
 
+
 # ------------------ STREAMLIT APP ------------------ #
 
 st.title("📈 Earnings Position Screener")
@@ -135,12 +91,7 @@ if st.button("Analyze"):
     if not df.empty:
         st.success("✅ Analysis complete.")
 
-        selected_filters = st.multiselect(
-            "Filter by Recommendation",
-            options=['Recommended', 'Consider', 'Avoid'],
-            default=['Recommended', 'Consider', 'Avoid']
-        )
-        filtered_df = df[df['Recommendation'].isin(selected_filters)]
+        filtered_df = df[df['Recommendation'] == 'Recommended']
 
         st.dataframe(
             filtered_df[['Ticker', 'avg_volume', 'iv30_rv30', 'iv30_rv30_val',
