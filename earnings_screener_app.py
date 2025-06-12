@@ -86,7 +86,7 @@ def compute_recommendation(ticker):
 
         result = {
             'Ticker': ticker,
-            'Price': price,
+            'Price': round(price, 2),
             'avg_volume': 'PASS' if avg_vol >= 1_500_000 else 'FAIL',
             'iv30_rv30': 'PASS' if iv30_rv30 >= 1.25 else 'FAIL',
             'ts_slope_0_45': 'PASS' if ts_slope <= -0.00406 else 'FAIL',
@@ -114,7 +114,6 @@ def compute_recommendation(ticker):
     except Exception as e:
         return {'Ticker': ticker, 'Error': str(e)}
 
-
 # ------------------ STREAMLIT APP ------------------ #
 
 st.title("📈 Earnings Position Screener")
@@ -140,7 +139,7 @@ if st.button("Analyze"):
         filtered_df = df[df['Recommendation'] == 'Recommended']
 
         st.dataframe(
-            filtered_df[['Ticker', 'avg_volume', 'iv30_rv30', 'iv30_rv30_val',
+            filtered_df[['Ticker', 'Price', 'avg_volume', 'iv30_rv30', 'iv30_rv30_val',
                          'ts_slope_0_45', 'ts_slope_val', 'Expected Move', 'Recommendation']]
             .reset_index(drop=True),
             use_container_width=True
