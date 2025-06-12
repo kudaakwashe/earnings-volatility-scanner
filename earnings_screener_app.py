@@ -86,6 +86,7 @@ def compute_recommendation(ticker):
 
         result = {
             'Ticker': ticker,
+            'Price': price,
             'avg_volume': 'PASS' if avg_vol >= 1_500_000 else 'FAIL',
             'iv30_rv30': 'PASS' if iv30_rv30 >= 1.25 else 'FAIL',
             'ts_slope_0_45': 'PASS' if ts_slope <= -0.00406 else 'FAIL',
