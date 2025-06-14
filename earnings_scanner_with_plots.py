@@ -114,7 +114,7 @@ def compute_metrics_with_plot(ticker):
         return None, None
 
 def run_app_with_plots():
-    st.title("Earnings Option Strategy Scanner with IV Term Structure")
+    st.title("Earnings Option Strategy Scanner (Recommended Only)")
     tickers_input = st.text_input("Enter stock tickers (comma-separated)", "AAPL, MSFT, AMZN")
     if st.button("Run Scan"):
         tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
@@ -139,9 +139,11 @@ def run_app_with_plots():
                 else:
                     return 'Avoid'
             df['Recommendation'] = df.apply(get_recommendation, axis=1)
-            st.dataframe(df)
+            recommended_df = df[df['Recommendation'].str.contains('Recommended')]
+            st.dataframe(recommended_df)
             for ticker, fig in all_plots:
-                st.pyplot(fig)
+                if ticker in recommended_df['Ticker'].values:
+                    st.pyplot(fig)
         else:
             st.warning("No valid data could be retrieved for the tickers provided.")
 
