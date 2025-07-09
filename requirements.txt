@@ -6,3 +6,4 @@ scipy
 plotly
 matplotlib
 datetime
+lxml
