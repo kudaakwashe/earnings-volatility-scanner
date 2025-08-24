@@ -158,9 +158,9 @@ if st.button("Run Analysis"):
                 st.error(f"{symbol}: {error}")
             else:
 
-    if all_results:
-        st.subheader("📋 Summary Table")
-        st.dataframe(pd.DataFrame(all_results))
+                if all_results:
+                    st.subheader("📋 Summary Table")
+                    st.dataframe(pd.DataFrame(all_results))
         
         
     for ticker in [res["Ticker"] for res in all_results]:
