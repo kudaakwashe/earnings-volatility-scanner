@@ -1,9 +1,6 @@
+
 streamlit
 yfinance
 numpy
-pandas
 scipy
-plotly
-matplotlib
-datetime
-lxml
+pandas
