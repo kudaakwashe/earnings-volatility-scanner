@@ -173,28 +173,28 @@ if st.button("Run Analysis"):
             st.line_chart(chart_data)
     
 
-        if result['avg_volume_pass'] and result['iv30_rv30_pass'] and result['ts_slope_pass']:
-            st.success("✅ Recommended")
-        elif result['ts_slope_pass'] and (result['avg_volume_pass'] or result['iv30_rv30_pass']):
-            st.warning("⚠️ Consider")
-        else:
-            st.error("❌ Avoid")
-
-        st.markdown(f"- **Expected Move**: {result['expected_move']}")
-        st.markdown(f"- **IV Rank (1Y)**: {result['iv_rank']}")
-        st.markdown(f"- **Avg Volume**: {'✅ PASS' if result['avg_volume_pass'] else '❌ FAIL'}")
-        st.markdown(f"- **IV30 / RV30**: {'✅ PASS' if result['iv30_rv30_pass'] else '❌ FAIL'}")
-
-        st.markdown(f"- **Term Structure Slope**: {'✅ PASS' if result['ts_slope_pass'] else '❌ FAIL'}")
-        all_results.append({
-            "Ticker": symbol,
-            "Expected Move": result['expected_move'],
-            "IV Rank (1Y)": result['iv_rank'],
-            "Avg Volume": "PASS" if result['avg_volume_pass'] else "FAIL",
-            "IV30/RV30": "PASS" if result['iv30_rv30_pass'] else "FAIL",
-            "Slope": "PASS" if result['ts_slope_pass'] else "FAIL",
-            "Recommendation": "Recommended" if result['avg_volume_pass'] and result['iv30_rv30_pass'] and result['ts_slope_pass']
-                             else "Consider" if result['ts_slope_pass'] and (result['avg_volume_pass'] or result['iv30_rv30_pass'])
-                             else "Avoid"
-        })
+            if result['avg_volume_pass'] and result['iv30_rv30_pass'] and result['ts_slope_pass']:
+                st.success("✅ Recommended")
+            elif result['ts_slope_pass'] and (result['avg_volume_pass'] or result['iv30_rv30_pass']):
+                st.warning("⚠️ Consider")
+            else:
+                st.error("❌ Avoid")
+    
+            st.markdown(f"- **Expected Move**: {result['expected_move']}")
+            st.markdown(f"- **IV Rank (1Y)**: {result['iv_rank']}")
+            st.markdown(f"- **Avg Volume**: {'✅ PASS' if result['avg_volume_pass'] else '❌ FAIL'}")
+            st.markdown(f"- **IV30 / RV30**: {'✅ PASS' if result['iv30_rv30_pass'] else '❌ FAIL'}")
+    
+            st.markdown(f"- **Term Structure Slope**: {'✅ PASS' if result['ts_slope_pass'] else '❌ FAIL'}")
+            all_results.append({
+                "Ticker": symbol,
+                "Expected Move": result['expected_move'],
+                "IV Rank (1Y)": result['iv_rank'],
+                "Avg Volume": "PASS" if result['avg_volume_pass'] else "FAIL",
+                "IV30/RV30": "PASS" if result['iv30_rv30_pass'] else "FAIL",
+                "Slope": "PASS" if result['ts_slope_pass'] else "FAIL",
+                "Recommendation": "Recommended" if result['avg_volume_pass'] and result['iv30_rv30_pass'] and result['ts_slope_pass']
+                                 else "Consider" if result['ts_slope_pass'] and (result['avg_volume_pass'] or result['iv30_rv30_pass'])
+                                 else "Avoid"
+            })
 
