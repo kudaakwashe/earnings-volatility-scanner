@@ -157,7 +157,6 @@ if st.button("Run Analysis"):
             if error:
                 st.error(f"{symbol}: {error}")
             else:
-
                 if all_results:
                     st.subheader("📋 Summary Table")
                     st.dataframe(pd.DataFrame(all_results))
