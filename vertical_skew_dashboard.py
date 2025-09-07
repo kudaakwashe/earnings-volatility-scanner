@@ -1,499 +1,235 @@
-"""
-DISCLAIMER:
-This software is provided solely for educational and research purposes.
-It is not intended to provide investment advice, and no investment recommendations are made herein.
-The authors are not financial advisors and accept no responsibility for financial decisions or losses.
-Always consult a professional financial advisor before making any investment decisions.
-"""
+# app.py — Skew Timeseries from local Dolt SQL server (table: option_chain)
+# DISCLAIMER: For educational/research use only. Not investment advice.
 
-from __future__ import annotations
-import math
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Tuple, Dict, Any
-
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy import create_engine, text
 import yfinance as yf
 
-# --------------------------
-# Streamlit config
-# --------------------------
-st.set_page_config(page_title="Vertical Skew — Snapshot, 10Δ/25Δ, History & Skewness", layout="wide")
-st.title("Vertical Skew — Snapshot, 10Δ/25Δ Smile Points, History & Skewness")
+# ───────────────────────── Streamlit UI ─────────────────────────
+st.set_page_config(page_title="Skew Timeseries — Local Dolt", layout="wide")
+st.title("Skew Timeseries (25Δ Call/Put vs ATM) — Local Dolt")
+st.caption("Call skew = (ATM IV − 25Δ Call IV) / ATM IV • Put skew = (ATM IV − 25Δ Put IV) / ATM IV • Nearest 25Δ via stored `delta`.")
 
-st.caption(
-    "Left panel: snapshot vertical skew (IV vs Strike) with highlighted **10Δ** and **25Δ** smile points "
-    "for puts & calls (plus Put–Call diffs). "
-    "Right panel: historical smile reconstruction (date × strike) and a **skewness time series** "
-    "(slope of IV vs moneyness)."
-)
-
-# ==========================================================
-# Black–Scholes pricing, Greeks, and IV inversion utilities
-# ==========================================================
-def _norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-def _norm_pdf(x: float) -> float:
-    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
-
-def bs_d1(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
-    return (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-
-def black_scholes_price(S: float, K: float, T: float, r: float, q: float, sigma: float, kind: Literal["call","put"]) -> float:
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return max(0.0, (S*math.exp(-q*T) - K*math.exp(-r*T)) if kind == "call" else (K*math.exp(-r*T) - S*math.exp(-q*T)))
-    d1 = bs_d1(S, K, T, r, q, sigma)
-    d2 = d1 - sigma * math.sqrt(T)
-    if kind == "call":
-        return S * math.exp(-q * T) * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
-    else:
-        return K * math.exp(-r * T) * _norm_cdf(-d2) - S * math.exp(-q * T) * _norm_cdf(-d1)
-
-def black_scholes_vega(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return 0.0
-    d1 = bs_d1(S, K, T, r, q, sigma)
-    return S * math.exp(-q * T) * _norm_pdf(d1) * math.sqrt(T)
-
-def bs_delta(S: float, K: float, T: float, r: float, q: float, sigma: float, kind: Literal["call","put"]) -> float:
-    """Black–Scholes delta with continuous dividend yield q."""
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return 0.0
-    d1 = bs_d1(S, K, T, r, q, sigma)
-    if kind == "call":
-        return math.exp(-q * T) * _norm_cdf(d1)
-    else:
-        return -math.exp(-q * T) * _norm_cdf(-d1)
-
-def implied_vol(price: float, S: float, K: float, T: float, r: float, q: float, kind: Literal["call","put"],
-                tol: float = 1e-6, max_iter: int = 100) -> float | None:
-    """Newton–Raphson with bisection fallback."""
-    if price <= 0 or S <= 0 or K <= 0 or T <= 0:
-        return None
-    # Seed by moneyness
-    m = abs(K / S - 1.0)
-    sigma = min(max(0.05 + 2.0*m, 0.05), 2.5)
-    for _ in range(max_iter):
-        model = black_scholes_price(S, K, T, r, q, sigma, kind)
-        diff = model - price
-        if abs(diff) < tol:
-            return float(sigma)
-        vega = black_scholes_vega(S, K, T, r, q, sigma)
-        if vega < 1e-8:
-            break
-        sigma = max(1e-4, sigma - diff / vega)
-    # Bisection
-    low, high = 1e-4, 5.0
-    for _ in range(60):
-        mid = 0.5 * (low + high)
-        pmid = black_scholes_price(S, K, T, r, q, mid, kind)
-        if abs(pmid - price) < tol:
-            return float(mid)
-        if pmid > price:
-            high = mid
-        else:
-            low = mid
-    return None
-
-# ===================
-# Cached data loaders
-# ===================
-@st.cache_data(show_spinner=False, ttl=300)
-def get_spot_and_divyield(ticker: str) -> Tuple[float, float]:
-    t = yf.Ticker(ticker)
-    price = None
-    try:
-        price = float(t.fast_info["last_price"])
-    except Exception:
-        hist = t.history(period="1d")
-        if not hist.empty:
-            price = float(hist["Close"].iloc[-1])
-    if price is None:
-        raise RuntimeError("Unable to get spot price.")
-
-    div_yield = 0.0
-    try:
-        dy = t.fast_info.get("dividend_yield", 0.0) or 0.0
-        if dy is None:
-            dy = 0.0
-        div_yield = float(dy)
-    except Exception:
-        pass
-    return price, div_yield
-
-@st.cache_data(show_spinner=False, ttl=300)
-def get_expirations(ticker: str) -> list[str]:
-    try:
-        return list(yf.Ticker(ticker).options or [])
-    except Exception:
-        return []
-
-@st.cache_data(show_spinner=True, ttl=300)
-def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    ch = yf.Ticker(ticker).option_chain(expiry)
-    calls = ch.calls.copy()
-    puts = ch.puts.copy()
-    for df, side in ((calls, "Call"), (puts, "Put")):
-        df["side"] = side
-    return calls, puts
-
-@st.cache_data(show_spinner=True, ttl=1200)
-def get_option_history(contract_symbol: str, lookback_days: int) -> pd.DataFrame:
-    hist = yf.Ticker(contract_symbol).history(period=f"{lookback_days}d", auto_adjust=False)
-    if hist.empty:
-        return hist
-    return hist[["Close"]].rename(columns={"Close": "opt_close"})
-
-@st.cache_data(show_spinner=True, ttl=1200)
-def get_underlying_history(ticker: str, lookback_days: int) -> pd.DataFrame:
-    hist = yf.Ticker(ticker).history(period=f"{lookback_days}d", auto_adjust=False)
-    return hist[["Close"]].rename(columns={"Close": "spot_close"})
-
-# ===================
-# Sidebar controls
-# ===================
 with st.sidebar:
-    st.header("Inputs")
-    ticker = st.text_input("Ticker", value="AAPL").strip().upper()
-    expiries = get_expirations(ticker) if ticker else []
-    expiry = st.selectbox("Expiry", options=expiries, index=0 if expiries else None)
-    side_hist = st.selectbox("Historical side", options=["Put", "Call"], index=0)
-    lookback_days = st.slider("Lookback (trading days approx.)", 10, 90, 30, help="Historical reconstruction window.")
-    strikes_window_pct = st.slider("Strikes around spot (±%)", 5, 80, 30, help="Keeps strikes within ±X% of spot.")
-    max_strikes = st.slider("Max strikes per side (history)", 3, 25, 10, help="Performance guardrail for history.")
-    rf_user = st.number_input("Risk-free rate (annual, decimal)", value=0.045, step=0.005, format="%.3f")
-    override_div = st.checkbox("Override dividend yield", value=False)
-    div_user = st.number_input("Dividend yield (annual, decimal)", value=0.000, step=0.005, format="%.3f", disabled=not override_div)
-    st.caption("Tip: Narrow the strike window and lower max strikes if it feels slow.")
+    st.subheader("Local Dolt connection")
+    st.write("Configure `.streamlit/secrets.toml` (example below).")
+    dolt_db = st.text_input("Database", value=st.secrets.get("dolt", {}).get("database", "options"))
+    dolt_branch = st.text_input("Branch (optional)", value="")   # e.g., master
+    dolt_commit = st.text_input("Commit hash (optional)", value="")  # read-only at commit
 
-if not ticker or not expiry:
-    st.stop()
+    st.subheader("Query params")
+    ticker = st.text_input("Ticker (act_symbol)", value="A").strip().upper()
+    target_dte = st.number_input("Target DTE (days)", 7, 90, 30, 1)
+    months = st.slider("Lookback (months)", 1, 24, 6)
+    table = st.text_input("Table", value="option_chain")
+    dates_are_text = st.checkbox("`date` is TEXT like YYYY/MM/DD", value=False)
 
-# ===================
-# Load basics
-# ===================
-try:
-    spot_now, dy_guess = get_spot_and_divyield(ticker)
-except Exception as e:
-    st.error(f"Failed to load spot/dividend: {e}")
-    st.stop()
+asof = datetime.now(timezone.utc)
+start_dt = asof - timedelta(days=30*months)
+end_dt   = asof
 
-q = div_user if override_div else dy_guess
-calls, puts = get_chain(ticker, expiry)
+# ───────────────────────── DB connection ─────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_engine_from_secrets(db_name: str):
+    """Expect secrets:
+    [dolt]
+    host="127.0.0.1"
+    port=3306
+    database="options"
+    user="root"
+    password=""
+    """
+    s = st.secrets.get("dolt", {})
+    host = s.get("host", "127.0.0.1")
+    port = int(s.get("port", 3306))
+    user = s.get("user", "root")
+    password = s.get("password", "")
+    uri = f"mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}"
+    return create_engine(uri, pool_pre_ping=True, pool_recycle=3600)
 
-def _clean_chain(df: pd.DataFrame) -> pd.DataFrame:
-    keep = [c for c in ["contractSymbol","strike","lastPrice","bid","ask","impliedVolatility","volume","openInterest","inTheMoney","side"] if c in df.columns]
-    df = df[keep].dropna(subset=["strike"]).copy()
-    df = df.drop_duplicates(subset=["contractSymbol"]) if "contractSymbol" in df.columns else df
-    # keep sensible IVs for snapshot calcs
-    if "impliedVolatility" in df.columns:
-        df = df[(df["impliedVolatility"] > 0) & (df["impliedVolatility"] < 5.0)]
-    return df.sort_values("strike")
+engine = get_engine_from_secrets(dolt_db)
 
-calls = _clean_chain(calls)
-puts  = _clean_chain(puts)
+def select_branch_or_commit(conn, branch: str, commit: str):
+    """Use Dolt session procs/vars to move the read view."""
+    try:
+        if branch.strip():
+            conn.execute(text("CALL DOLT_CHECKOUT(:b)"), {"b": branch.strip()})
+        if commit.strip():
+            conn.execute(text("SET @@dolt_read_from_commit = :h"), {"h": commit.strip()})
+    except Exception as e:
+        st.warning(f"Branch/commit selection failed; reading current HEAD. Detail: {e}")
 
-# Filter by moneyness window around current spot
-k_low, k_high = spot_now*(1 - strikes_window_pct/100.0), spot_now*(1 + strikes_window_pct/100.0)
-calls = calls[(calls["strike"]>=k_low) & (calls["strike"]<=k_high)]
-puts  = puts[(puts["strike"] >=k_low) & (puts["strike"] <=k_high)]
+# ───────────────────────── Data fetch ─────────────────────────
+@st.cache_data(ttl=600, show_spinner=True)
+def fetch_option_chain(symbol: str, start_dt: datetime, end_dt: datetime,
+                       table: str, branch: str, commit: str, dates_are_text: bool) -> pd.DataFrame:
+    start_iso = start_dt.strftime("%Y-%m-%d")
+    end_iso   = end_dt.strftime("%Y-%m-%d")
 
-# Trim to max_strikes nearest ATM for history (snapshot uses full window)
-def _nearest_atm(df: pd.DataFrame, max_n: int) -> pd.DataFrame:
-    if df.empty: return df
-    df = df.assign(dist=(df["strike"] - spot_now).abs()).sort_values("dist").head(max_n)
-    return df.drop(columns=["dist"]).sort_values("strike")
+    if dates_are_text:
+        date_filter = "STR_TO_DATE(`date`, '%Y/%m/%d') >= :s AND STR_TO_DATE(`date`, '%Y/%m/%d') <= :e"
+    else:
+        date_filter = "`date` >= :s AND `date` <= :e"
 
-calls_hist = _nearest_atm(calls, max_strikes)
-puts_hist  = _nearest_atm(puts,  max_strikes)
+    q = text(f"""
+        SELECT `date`,`act_symbol`,`expiration`,`strike`,`call_put`,`vol`,`delta`
+        FROM {table}
+        WHERE act_symbol = :tic
+          AND {date_filter}
+    """)
 
-# ===================
-# Time to expiry (years)
-# ===================
-def _expiry_to_datetime_utc(exp_str: str) -> datetime:
-    dt = datetime.strptime(exp_str, "%Y-%m-%d")
-    return datetime(dt.year, dt.month, dt.day, 20, 0, 0, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        select_branch_or_commit(conn, branch, commit)
+        df = pd.read_sql(q, conn, params={"tic": symbol, "s": start_iso, "e": end_iso})
 
-exp_dt_utc = _expiry_to_datetime_utc(expiry)
-now_utc = datetime.now(timezone.utc)
-T_snapshot = max((exp_dt_utc - now_utc).total_seconds() / (365.0*24*3600), 1e-6)
+    for col in ["date", "expiration"]:
+        parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
+        if parsed.isna().all():
+            parsed = pd.to_datetime(df[col], errors="coerce", utc=True, format="%Y/%m/%d")
+        df[col] = parsed
 
-# ==========================================================
-# 10Δ & 25Δ smile points (snapshot)
-# ==========================================================
-def compute_delta_for_df(df: pd.DataFrame, S: float, T: float, r: float, q: float, kind: Literal["call","put"]) -> pd.DataFrame:
-    """Add columns: 'delta' computed from each row's IV."""
+    df["call_put"] = df["call_put"].astype(str).str.capitalize().str[:3]
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    for c in ["vol","delta"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["date","expiration","strike"]).drop_duplicates()
+    df = df.sort_values(["date","expiration","strike"]).reset_index(drop=True)
+    return df
+
+# ───────────────────────── Spot fill ─────────────────────────
+def fill_spot_from_yahoo(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    px = yf.Ticker(symbol).history(period="2y")["Close"].rename("spot").to_frame()
+    px.index = pd.to_datetime(px.index.date)
     out = df.copy()
-    if "impliedVolatility" not in out.columns or out.empty:
-        out["delta"] = np.nan
-        return out
-    deltas = []
-    for _, row in out.iterrows():
-        K = float(row["strike"])
-        iv = float(row["impliedVolatility"])
-        if not (0 < iv < 5.0):
-            deltas.append(np.nan)
-            continue
-        deltas.append(bs_delta(S=S, K=K, T=T, r=r, q=q, sigma=iv, kind=kind))
-    out["delta"] = deltas
+    out["asof_date"] = pd.to_datetime(out["date"].dt.date)
+    out = out.merge(px, left_on="asof_date", right_index=True, how="left")
     return out
 
-def find_delta_point(df_with_delta: pd.DataFrame, target_abs_delta: float, kind: Literal["call","put"]) -> Dict[str, Any] | None:
-    """Find contract with delta closest to +target (call) or -target (put)."""
-    if df_with_delta.empty or "delta" not in df_with_delta.columns:
+# ───────────────────────── Skew calc ─────────────────────────
+def compute_skew_for_day(day_df: pd.DataFrame, snap_dt: pd.Timestamp, target_dte: int):
+    snap_dt = pd.Timestamp(snap_dt).tz_localize(None).normalize()
+    day = day_df.copy()
+    day["expiration"] = pd.to_datetime(day["expiration"]).dt.tz_localize(None).dt.normalize()
+    day["date"] = pd.to_datetime(day["date"]).dt.tz_localize(None).dt.normalize()
+    day["dte"] = (day["expiration"] - snap_dt).dt.days
+
+    cand = day.loc[day["dte"] >= 1, ["expiration","dte"]].drop_duplicates()
+    if cand.empty:
         return None
-    d = df_with_delta.dropna(subset=["delta"]).copy()
-    if d.empty:
+    pick_exp = cand.iloc[(cand["dte"] - target_dte).abs().argsort()[:1]]["expiration"].values[0]
+
+    S = day["spot"].dropna().mean()
+    if not (np.isfinite(S) and S > 0):
         return None
-    if kind == "call":
-        d["delta_diff"] = (d["delta"] - target_abs_delta).abs()
-    else:
-        d["delta_diff"] = (d["delta"] + target_abs_delta).abs()  # put deltas are negative
-    row = d.nsmallest(1, "delta_diff")
-    if row.empty:
+
+    calls = day[(day["expiration"]==pick_exp) & (day["call_put"]=="Call")].copy()
+    puts  = day[(day["expiration"]==pick_exp) & (day["call_put"]=="Put") ].copy()
+    if calls.empty and puts.empty:
         return None
-    r = row.iloc[0]
+
+    atm_strike_candidates = pd.concat([calls[["strike"]], puts[["strike"]]], ignore_index=True)
+    if atm_strike_candidates.empty:
+        return None
+    atm_strike = atm_strike_candidates.iloc[(atm_strike_candidates["strike"] - S).abs().argsort()[:1]]["strike"].values[0]
+
+    def iv_at_strike(df, K):
+        if df is None or df.empty:
+            return np.nan
+        sub = df.iloc[(df["strike"] - K).abs().argsort()[:1]]
+        return sub["vol"].values[0] if len(sub) else np.nan
+
+    atm_call_iv = iv_at_strike(calls, atm_strike)
+    atm_put_iv  = iv_at_strike(puts,  atm_strike)
+    iv_atm = np.nanmean([atm_call_iv, atm_put_iv])
+
+    call25_iv = np.nan
+    if not calls.empty and "delta" in calls:
+        c = calls.dropna(subset=["delta"])
+        if not c.empty:
+            call25_iv = c.iloc[(c["delta"] - 0.25).abs().argsort()[:1]]["vol"].values[0]
+    put25_iv = np.nan
+    if not puts.empty and "delta" in puts:
+        p = puts.dropna(subset=["delta"])
+        if not p.empty:
+            put25_iv = p.iloc[(p["delta"].abs() - 0.25).abs().argsort()[:1]]["vol"].values[0]
+
+    call_skew = (iv_atm - call25_iv) / iv_atm if (np.isfinite(iv_atm) and iv_atm > 0 and np.isfinite(call25_iv)) else np.nan
+    put_skew  = (iv_atm - put25_iv)  / iv_atm if (np.isfinite(iv_atm) and iv_atm > 0 and np.isfinite(put25_iv))  else np.nan
+    rr = call_skew - put_skew if np.isfinite(call_skew) and np.isfinite(put_skew) else np.nan
+
     return {
-        "contractSymbol": r.get("contractSymbol"),
-        "strike": float(r["strike"]),
-        "iv": float(r["impliedVolatility"]) if "impliedVolatility" in r else np.nan,
-        "delta": float(r["delta"]),
+        "asof": pd.to_datetime(snap_dt.date()),
+        "expiration": pd.to_datetime(pd.Timestamp(pick_exp).date()),
+        "dte": int((pd.Timestamp(pick_exp).date() - snap_dt.date()).days),
+        "spot": S,
+        "atm_iv": iv_atm,
+        "call25_iv": call25_iv,
+        "put25_iv":  put25_iv,
+        "call_skew": call_skew,
+        "put_skew":  put_skew,
+        "rr": rr
     }
 
-# Prepare deltas for snapshot
-calls_d = compute_delta_for_df(calls, spot_now, T_snapshot, rf_user, q, "call")
-puts_d  = compute_delta_for_df(puts,  spot_now, T_snapshot, rf_user, q, "put")
-
-targets = [0.25, 0.10]
-smile_points = []
-for tgt in targets:
-    c_pt = find_delta_point(calls_d, tgt, "call")
-    p_pt = find_delta_point(puts_d,  tgt, "put")
-    if c_pt or p_pt:
-        smile_points.append({
-            "delta_abs": tgt,
-            "call_iv": c_pt["iv"] if c_pt else np.nan,
-            "call_strike": c_pt["strike"] if c_pt else np.nan,
-            "put_iv": p_pt["iv"] if p_pt else np.nan,
-            "put_strike": p_pt["strike"] if p_pt else np.nan,
-            "put_minus_call": (p_pt["iv"] - c_pt["iv"]) if (c_pt and p_pt) else np.nan
-        })
-
-smile_df = pd.DataFrame(smile_points, columns=["delta_abs","call_iv","call_strike","put_iv","put_strike","put_minus_call"])
-
-# ==========================================================
-# Historical reconstruction helpers
-# ==========================================================
-@st.cache_data(show_spinner=True, ttl=900)
-def build_hist_iv_table(ticker: str, selection: pd.DataFrame, lookback_days: int, rf: float, q: float,
-                        kind: Literal["call","put"], exp_dt_utc: datetime) -> pd.DataFrame:
-    """Date-indexed DataFrame with columns=strike, values=IV (decimal)."""
-    if selection.empty:
+def build_timeseries(df: pd.DataFrame, symbol: str, target_dte: int) -> pd.DataFrame:
+    if df.empty:
         return pd.DataFrame()
-    u_hist = get_underlying_history(ticker, lookback_days)
-    if u_hist.empty:
-        return pd.DataFrame()
-    u_hist = u_hist.dropna()
-    u_hist.index = pd.to_datetime(u_hist.index).tz_localize(None)
+    df = fill_spot_from_yahoo(df, symbol)
+    out = []
+    for snap_dt, day_df in df.groupby(df["date"].dt.normalize()):
+        res = compute_skew_for_day(day_df, snap_dt, target_dte)
+        if res:
+            out.append(res)
+    return pd.DataFrame(out).sort_values("asof")
 
-    frames = []
-    for _, row in selection.iterrows():
-        sym = row["contractSymbol"]; K = float(row["strike"])
-        h = get_option_history(sym, lookback_days)
-        if h.empty: 
-            continue
-        h = h.dropna()
-        h.index = pd.to_datetime(h.index).tz_localize(None)
-        df = pd.concat([u_hist, h], axis=1, join="inner").dropna()
+def plot_skew_timeseries(ts: pd.DataFrame, mode="Call"):
+    if ts is None or ts.empty:
+        return go.Figure()
+    col = {"Call": "call_skew", "Put": "put_skew", "RR": "rr"}[mode]
+    d = ts[["asof", col]].dropna().sort_values("asof")
+    mu, sig = d[col].mean(), d[col].std()
 
-        dates = pd.to_datetime(df.index)
-        T = (pd.to_datetime(exp_dt_utc).tz_convert(None) - dates).dt.total_seconds() / (365.0*24*3600)
-        df = df.assign(T=T.values)
-        df = df[df["T"] > 0].copy()
-        if df.empty: 
-            continue
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d["asof"], y=d[col], mode="lines+markers", name=f"{mode} Skew",
+        hovertemplate="%{x|%b %d, %Y}<br>"+f"{mode} Skew: %{y:.2%}"
+    ))
+    for name, val, dash in [("Mean", mu, "dash"), ("+1σ", mu+sig, "dot"), ("-1σ", mu-sig, "dot")]:
+        fig.add_hline(y=float(val), line_dash=dash, annotation_text=name, annotation_position="right")
+    fig.update_layout(template="plotly_dark", height=440, margin=dict(l=30,r=20,t=50,b=30),
+                      title=f"Skew Timeseries — {mode}", xaxis_title="Date",
+                      yaxis_title=f"{mode} Skew (fraction)", hovermode="x unified")
+    return fig
 
-        ivs = []
-        for (S, price, ttm) in zip(df["spot_close"].values, df["opt_close"].values, df["T"].values):
-            iv = implied_vol(price=float(price), S=float(S), K=float(K), T=float(ttm), r=float(rf), q=float(q), kind=kind)
-            ivs.append(iv if iv is not None and 0 < iv < 5.0 else np.nan)
-        df[f"IV_{kind}_{K:g}"] = ivs
-        frames.append(df[[f"IV_{kind}_{K:g}"]])
+# ───────────────────────── Run ─────────────────────────
+with st.spinner("Querying local Dolt and computing skews…"):
+    rows = fetch_option_chain(ticker, start_dt, end_dt, table, dolt_branch, dolt_commit, dates_are_text)
+    ts = build_timeseries(rows, ticker, target_dte)
 
-    if not frames:
-        return pd.DataFrame()
-    joined = pd.concat(frames, axis=1)
-    joined.columns = [col.split("_")[-1] for col in joined.columns]  # strike only
-    joined.index.name = "date"
-    try:
-        joined.columns = [float(c) for c in joined.columns]
-    except Exception:
-        pass
-    joined = joined.sort_index().sort_index(axis=1)
-    return joined
-
-# ===================
-# Layout: two-panel dashboard
-# ===================
-left_col, right_col = st.columns([1.05, 1.35], vertical_alignment="top")
-
-# -------------------
-# LEFT: Snapshot + 10Δ/25Δ
-# -------------------
-with left_col:
-    st.subheader("Snapshot: Vertical Skew (IV vs Strike) + 10Δ / 25Δ")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Spot", f"{spot_now:,.2f}")
-    m2.write(f"**Expiry:** `{expiry}`")
-    m3.write(f"**T (yrs):** `{T_snapshot:.3f}`")
-
-    # Prepare snapshot plotting data
-    snap_df = []
-    if not calls.empty: 
-        c_df = calls.copy(); c_df["Series"] = "Call"; snap_df.append(c_df)
-    if not puts.empty:  
-        p_df = puts.copy();  p_df["Series"] = "Put";  snap_df.append(p_df)
-    snap_df = pd.concat(snap_df, ignore_index=True) if snap_df else pd.DataFrame()
-
-    if snap_df.empty:
-        st.warning("No contracts found in the selected window.")
+left, right = st.columns([1,1])
+with left:
+    st.subheader(f"{ticker} • {months}m • DTE≈{target_dte}d")
+    if ts.empty:
+        st.info("No timeseries built. Check DB/branch/commit, table/columns, and date format toggle.")
     else:
-        fig_snap = px.line(
-            snap_df, x="strike", y="impliedVolatility", color="Series", markers=True,
-            labels={"strike":"Strike", "impliedVolatility":"IV (decimal)"},
-            title=f"{ticker} — {expiry} — Vertical Skew (Snapshot)"
-        )
+        st.plotly_chart(plot_skew_timeseries(ts, "Call"), use_container_width=True)
+with right:
+    if not ts.empty:
+        st.plotly_chart(plot_skew_timeseries(ts, "Put"), use_container_width=True)
 
-        # Overlay 10Δ and 25Δ markers if available
-        markers = []
-        for _, row in smile_df.iterrows():
-            da = row["delta_abs"]
-            # Call marker
-            if np.isfinite(row["call_iv"]) and np.isfinite(row["call_strike"]):
-                markers.append({"strike": row["call_strike"], "iv": row["call_iv"], "Series": f"Call {int(da*100)}Δ"})
-            # Put marker
-            if np.isfinite(row["put_iv"]) and np.isfinite(row["put_strike"]):
-                markers.append({"strike": row["put_strike"], "iv": row["put_iv"], "Series": f"Put {int(da*100)}Δ"})
-
-        if markers:
-            mk_df = pd.DataFrame(markers)
-            fig_snap.add_trace(
-                go.Scatter(
-                    x=mk_df["strike"], y=mk_df["iv"], mode="markers+text",
-                    text=mk_df["Series"], textposition="top center",
-                    marker=dict(size=10, symbol="x"),
-                    name="Δ markers"
-                )
-            )
-
-        st.plotly_chart(fig_snap, use_container_width=True)
-
-        # Smile points table (Put/Call IVs and Put–Call diff)
-        if not smile_df.empty:
-            st.markdown("**10Δ & 25Δ Smile Points (snapshot)**")
-            display = smile_df.copy()
-            display["delta_abs"] = display["delta_abs"].map(lambda x: f"{int(x*100)}Δ")
-            display = display.rename(columns={
-                "delta_abs": "Δ",
-                "call_iv": "Call IV",
-                "call_strike": "Call Strike",
-                "put_iv": "Put IV",
-                "put_strike": "Put Strike",
-                "put_minus_call": "Put − Call (IV)"
-            })
-            st.dataframe(display, use_container_width=True, height=160)
-
-# -------------------
-# RIGHT: History (top) + Skewness series (bottom)
-# -------------------
-with right_col:
-    st.subheader("Historical Vertical Skew & Skewness")
-
-    # --- Historical vertical skew (top) ---
-    st.markdown("**Historical smile (reconstructed IV by strike over time)**")
-    sel_hist = puts_hist if side_hist == "Put" else calls_hist
-    hist_ivs = build_hist_iv_table(
-        ticker=ticker, selection=sel_hist, lookback_days=lookback_days,
-        rf=rf_user, q=q, kind="put" if side_hist == "Put" else "call", exp_dt_utc=exp_dt_utc
+st.markdown("### Summary")
+if not ts.empty:
+    st.dataframe(
+        ts.sort_values("asof", ascending=False)[
+            ["asof","expiration","dte","spot","atm_iv","call25_iv","put25_iv","call_skew","put_skew","rr"]
+        ].style.format({
+            "spot":"{:.2f}",
+            "atm_iv":"{:.2%}","call25_iv":"{:.2%}","put25_iv":"{:.2%}",
+            "call_skew":"{:.2%}","put_skew":"{:.2%}","rr":"{:.2%}"
+        }),
+        use_container_width=True, height=360
     )
-
-    if hist_ivs.empty:
-        st.warning("No historical data could be built (option histories may be missing). Try fewer strikes or another expiry.")
-    else:
-        tidy = hist_ivs.reset_index().melt(id_vars="date", var_name="strike", value_name="iv").dropna().sort_values(["date","strike"])
-        fig_lines = px.line(
-            tidy, x="date", y="iv", color="strike",
-            title=f"{ticker} — {expiry} — Historical IV by Strike ({side_hist}s)",
-            labels={"iv":"IV (decimal)", "date":"Date", "strike":"Strike"}
-        )
-        st.plotly_chart(fig_lines, use_container_width=True)
-
-    # --- Skewness time series (bottom) ---
-    st.markdown("**Skewness time series (slope of IV vs moneyness)**")
-    # If we already have hist_ivs above for a side, reuse; otherwise compute for the other side.
-    def get_hist_for_side(which: str) -> pd.DataFrame:
-        if which == side_hist:
-            return hist_ivs
-        sel = puts_hist if which == "Put" else calls_hist
-        return build_hist_iv_table(
-            ticker=ticker, selection=sel, lookback_days=lookback_days,
-            rf=rf_user, q=q, kind="put" if which == "Put" else "call", exp_dt_utc=exp_dt_utc
-        )
-
-    skew_side = st.radio("Skewness side", ["Put", "Call"], horizontal=True, index=0, key="skew_side_radio")
-    hist_for_skew = get_hist_for_side(skew_side)
-
-    if hist_for_skew.empty:
-        st.warning("Could not reconstruct IV history for skewness calculation.")
-    else:
-        u_hist = get_underlying_history(ticker, lookback_days)
-        if u_hist.empty:
-            st.warning("No underlying history available.")
-        else:
-            u_hist = u_hist.dropna()
-            u_hist.index = pd.to_datetime(u_hist.index).tz_localize(None)
-            df = hist_for_skew.join(u_hist, how="inner").dropna(subset=["spot_close"])
-            if df.empty:
-                st.warning("No overlapping dates between option and underlying history.")
-            else:
-                slopes, dates = [], []
-                for dt_idx, row in df.iterrows():
-                    S = float(row["spot_close"])
-                    ivs = row.drop(labels=["spot_close"]).astype(float)
-                    strikes = ivs.index.astype(float)
-                    iv_vals = ivs.values
-                    mask = np.isfinite(iv_vals)
-                    strikes = strikes[mask]; iv_vals = iv_vals[mask]
-                    if len(iv_vals) < 3:
-                        continue
-                    moneyness = strikes / S - 1.0
-                    mm = np.clip(moneyness, -1.0, 1.0)
-                    coeffs = np.polyfit(mm, iv_vals, 1)  # slope, intercept
-                    slopes.append(float(coeffs[0])); dates.append(dt_idx)
-
-                if not slopes:
-                    st.warning("Insufficient data to compute skewness time series.")
-                else:
-                    skew_df = pd.DataFrame({"date": dates, "skew_slope": slopes}).sort_values("date")
-                    fig_skew = px.line(
-                        skew_df, x="date", y="skew_slope",
-                        title=f"{ticker} — {expiry} — Skewness (slope IV~moneyness) over time [{skew_side}s]",
-                        labels={"date":"Date", "skew_slope":"Slope (per unit moneyness)"}
-                    )
-                    fig_skew.add_hline(y=0.0, line_dash="dash")
-                    st.plotly_chart(fig_skew, use_container_width=True)
-
-# -------------------
-# Footer tips
-# -------------------
-st.info(
-    "Performance tips:\n"
-    "- Reduce **Lookback**, **Max strikes**, or **Strikes ±%** if it’s slow.\n"
-    "- If a contract has no history, it’s skipped (data gaps are normal).\n"
-    "- Adjust **risk-free** and **dividend** yields if pricing looks off.\n"
-    "- Δ points are chosen from *listed* contracts by closest delta; they are approximations."
-)
